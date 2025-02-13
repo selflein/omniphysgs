@@ -131,13 +131,12 @@ We would like to thank the authors of [PhysGaussian](https://xpandora.github.io/
 ## 📚 Citation
 If you find our work helpful, please consider citing:
 ```bibtex
-@misc{lin2025omniphysgs3dconstitutivegaussians,
-      title={OmniPhysGS: 3D Constitutive Gaussians for General Physics-Based Dynamics Generation}, 
-      author={Yuchen Lin and Chenguo Lin and Jianjin Xu and Yadong Mu},
-      year={2025},
-      eprint={2501.18982},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2501.18982}, 
+@inproceedings{
+lin2025omniphysgs,
+title={OmniPhys{GS}: 3D Constitutive Gaussians for General Physics-Based Dynamics Generation},
+author={Yuchen Lin and Chenguo Lin and Jianjin Xu and Yadong MU},
+booktitle={The Thirteenth International Conference on Learning Representations},
+year={2025},
+url={https://openreview.net/forum?id=9HZtP6I5lv}
 }
 ```
