@@ -24,6 +24,7 @@ Feel free to contact me (linyuchen@stu.pku.edu.cn) or open an issue if you have 
 
 
 ## 📢 News
+- **2025-03-19**: A clean version of our PyTorch MPM solver is released [here](https://github.com/wgsxm/MPM-PyTorch)
 - **2025-02-03**: The source code and preprocessed dataset are released.
 - **2025-01-22**: OmniPhysGS is accepted by ICLR 2025.
 
