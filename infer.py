@@ -59,8 +59,7 @@ def init_training(cfg, args=None):
     wp.set_module_options({"fast_math": False})
 
     # init taichi
-    if cfg.preprocessing.particle_filling is not None:
-        ti.init(arch=ti.cuda, device_memory_GB=8.0)
+    ti.init(arch=ti.cuda, device_memory_GB=8.0)
 
     # init torch
     torch_device = torch.device(device)
@@ -109,6 +108,14 @@ def main(cfg, args=None):
     (mpm_params, init_e_cat, init_p_cat, unselected_params, translate_params, screen_points) = load_params(
         gaussians, pipeline, preprocessing_params, material_params, model_params, export_path=export_path
     )
+    gs_num = mpm_params["pos"].shape[0]
+    # TODO: Set from our VLM prediction for each Gaussian particle
+    # This should probably happen in the `load_params` function
+    e_cat = torch.zeros((gs_num, len(material_params.elasticity_physicals)), device=torch_device)
+    p_cat = torch.zeros((gs_num, len(material_params.plasticity_physicals)), device=torch_device)
+    log_E = torch.full((gs_num, 1), 2.0e6, device=torch_device).log()
+    nu = torch.full((gs_num, 1), 0.4, device=torch_device)
+    density = torch.full((gs_num, 1), material_params['rho'], device=torch_device)
 
     # get preprocessed gaussian params
     trans_pos = mpm_params["pos"]
@@ -121,7 +128,6 @@ def main(cfg, args=None):
     scale_origin = translate_params["scale_origin"]
     original_mean_pos = translate_params["original_mean_pos"]
 
-    gs_num = trans_pos.shape[0]
 
     print(f"Built gaussian particle number: {gs_num}\n")
 
@@ -155,7 +161,7 @@ def main(cfg, args=None):
 
     # init mpm model and material
     print("Building MPM simulator and setting boundary conditions\n")
-    mpm_model = MPMModel(sim_params, material_params, init_pos=trans_pos, enable_train=False, device=torch_device)
+    mpm_model = MPMModel(sim_params, init_pos=trans_pos, density=density, enable_train=False, device=torch_device)
     set_boundary_conditions(mpm_model, sim_params.boundary_conditions)
 
     # material
@@ -191,11 +197,6 @@ def main(cfg, args=None):
     v = v.requires_grad_(False)
     C = C.requires_grad_(False)
     F = F.requires_grad_(False)
-
-    # Init physicals distribution
-    # TODO: Set from our VLM prediction for each Gaussian particle
-    e_cat = torch.zeros((gs_num, len(material_params.elasticity_physicals)), device=torch_device)
-    p_cat = torch.zeros((gs_num, len(material_params.plasticity_physicals)), device=torch_device)
 
     # skip first few frames to accelerate training
     # this frames are meaningless when there is no contact or collision
@@ -237,7 +238,7 @@ def main(cfg, args=None):
 
         for step in range(steps_per_frame):
             # mpm step, using checkpoint to save memory
-            stress = checkpoint(elasticity, F, e_cat)
+            stress = checkpoint(elasticity, F, e_cat, log_E, nu)
 
             assert torch.all(torch.isfinite(stress))
 
@@ -246,7 +247,7 @@ def main(cfg, args=None):
             assert torch.all(torch.isfinite(x))
             assert torch.all(torch.isfinite(F))
 
-            F = checkpoint(plasticity, F, p_cat)
+            F = checkpoint(plasticity, F, p_cat, log_E, nu)
 
             assert torch.all(torch.isfinite(F))
 

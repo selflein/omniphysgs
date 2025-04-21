@@ -60,12 +60,12 @@ class GumbelElasticity(Elasticity):
         self.physicals = nn.ModuleList([getattr(physical, p)().to(device) for p in physicals])
         self.category_dim = len(self.physicals)
         
-    def forward(self, F: Tensor, elasticity_category: Tensor) -> Tensor:
+    def forward(self, F: Tensor, elasticity_category: Tensor, log_E: Tensor | None = None, nu: Tensor | None =None) -> Tensor:
         assert elasticity_category.shape[1] == self.category_dim
         # max_category = torch.functional.F.gumbel_softmax(elasticity_category, tau=1.0, dim=1, hard=True) # num_particles * category_dim
         max_category = hard_softmax(elasticity_category, dim=1)
         max_category = max_category.unsqueeze(dim=2).unsqueeze(dim=3) # num_particles * category_dim * 1 * 1
-        possible_stress = [p(F) for p in self.physicals] # category_dim * num_particles * 3 * 3
+        possible_stress = [p(F, log_E, nu) for p in self.physicals] # category_dim * num_particles * 3 * 3
         possible_stress = torch.stack(possible_stress, dim=1) # num_particles * category_dim * 3 * 3
         stress = possible_stress * max_category # num_particles * category_dim * 3 * 3
         stress = stress.sum(dim=1) # num_particles * 3 * 3
@@ -85,12 +85,12 @@ class GumbelPlasticity(Plasticity):
         self.physicals = nn.ModuleList([getattr(physical, p)().to(device) for p in physicals])
         self.category_dim = len(self.physicals)
         
-    def forward(self, F: Tensor, plasticity_category: Tensor) -> Tensor:
+    def forward(self, F: Tensor, plasticity_category: Tensor, log_E: Tensor | None = None, nu: Tensor | None = None) -> Tensor:
         assert plasticity_category.shape[1] == self.category_dim
         # max_category = torch.functional.F.gumbel_softmax(plasticity_category, tau=5.0, dim=1, hard=True) # num_particles * category_dim
         max_category = hard_softmax(plasticity_category, dim=1)
         max_category = max_category.unsqueeze(dim=2).unsqueeze(dim=3) # num_particles * category_dim * 1 * 1
-        possible_stress = [p(F) for p in self.physicals] # category_dim * num_particles * 3 * 3
+        possible_stress = [p(F, log_E, nu) for p in self.physicals] # category_dim * num_particles * 3 * 3
         possible_stress = torch.stack(possible_stress, dim=1) # num_particles * category_dim * 3 * 3
         stress = possible_stress * max_category # num_particles * category_dim * 3 * 3
         stress = stress.sum(dim=1) # num_particles * 3 * 3

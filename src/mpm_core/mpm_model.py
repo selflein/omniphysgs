@@ -2,15 +2,18 @@ from typing import *
 
 import numpy as np
 import torch
-from torch import Tensor
 from omegaconf import DictConfig
+from torch import Tensor
+
+from src.utils.filling_utils import get_particle_volume
+
 
 class MPMModel:
     def __init__(
         self, 
         sim_params: DictConfig,
-        material_params: DictConfig, 
-        init_pos: Tensor, 
+        init_pos: Tensor,
+        density: Tensor,
         enable_train: bool=False,
         device: torch.device='cuda',
     ):
@@ -19,10 +22,17 @@ class MPMModel:
         self.dt: float = sim_params['dt']
         self.gravity: Tensor = torch.tensor(sim_params['gravity'], device=device)
         self.boundary_condition: Optional[DictConfig] = sim_params.get('boundary_condition', None)
-        
+
         self.dx: float = 1 / self.num_grids
         self.inv_dx: float = float(self.num_grids)
-        
+
+        self.vol = get_particle_volume(
+            init_pos,
+            grid_n=self.num_grids,
+            grid_dx=self.dx,
+            unifrom=False,
+        ).to(device=device).unsqueeze(-1)
+
         self.clip_bound: float = sim_params.get('clip_bound', 0.5) * self.dx
         self.damping = sim_params.get('damping', 1.0)
         assert self.clip_bound >= 0.0
@@ -31,10 +41,7 @@ class MPMModel:
         self.n_particles: int = init_pos.shape[0]
         self.init_pos: Tensor = init_pos.detach()
         
-        self.center: np.ndarray = np.array(material_params['center'])
-        self.size: np.ndarray = np.array(material_params['size'])
-        self.vol: float = np.prod(self.size) / self.n_particles
-        self.p_mass: float = material_params['rho'] * self.vol  # TODO: the mass can be non-constant.
+        self.p_mass: Tensor = density * self.vol
 
         self.enable_train: bool = enable_train
         self.device: torch.device = device
@@ -116,8 +123,8 @@ class MPMModel:
             operation(self, x, v)
         
         # p2g
-        mv = -dt * vol * torch.einsum('bij, bkj -> bki', stress, dweight) +\
-            p_mass * weight.unsqueeze(2) * (v.unsqueeze(1) + torch.einsum('bij, bkj -> bki', C, dpos)) # (n_particles, 3, 3), (n_particles, 27, 3) -> (n_particles, 27, 3)
+        mv = -dt * vol.unsqueeze(-1) * torch.einsum('bij, bkj -> bki', stress, dweight) +\
+            (p_mass * weight).unsqueeze(2) * (v.unsqueeze(1) + torch.einsum('bij, bkj -> bki', C, dpos)) # (n_particles, 3, 3), (n_particles, 27, 3) -> (n_particles, 27, 3)
         mv = mv.reshape(-1, 3) # (n_particles * 27, 3)
         
         m = weight * p_mass # (n_particles, 27)
