@@ -1,33 +1,26 @@
-import sys
-import argparse
 import math
-import cv2
-import torchvision
-import torch
 import os
-import numpy as np
-import json
-import copy
-from tqdm import tqdm
+import sys
+from pathlib import Path
+
+import cv2
 import imageio
+import numpy as np
+import torch
 
 from .camera_view_utils import get_camera_view
-from .transformation_utils import *
 from .filling_utils import *
+from .transformation_utils import *
 
-# Gaussian splatting dependencies
-sys.path.append("third_party/gaussian-splatting")
-from utils.sh_utils import eval_sh
-from scene.gaussian_model import GaussianModel
 from diff_gaussian_rasterization import (
     GaussianRasterizationSettings,
     GaussianRasterizer,
 )
-from scene.cameras import Camera as GSCamera
-from gaussian_renderer import render, GaussianModel
+from gaussian_renderer import GaussianModel
+from scene.gaussian_model import GaussianModel
+from utils.sh_utils import eval_sh
 from utils.system_utils import searchForMaxIteration
-from utils.graphics_utils import focal2fov
-from utils.loss_utils import l1_loss, l2_loss, ssim
+
 
 class PipelineParamsNoparse:
     """Same as PipelineParams but without argument parser."""
@@ -358,18 +351,20 @@ def render_mpm_gaussian(
         rgb1 = torch.tensor([255,0,0], device='cuda').float() / 255
         rgb2 = torch.tensor([0,0,255], device='cuda').float() / 255
         colors_precomp = interpolate_rgb(rgb1, rgb2, vis.unsqueeze(1))
-        
-    rendering, raddi = rasterize(
+
+    semantic_feature = torch.zeros((pos.shape[0], 256), device='cuda')
+    color = rasterize(
         means3D=pos,
         means2D=screen_points,
         shs=None,
         colors_precomp=colors_precomp,
+        semantic_feature=semantic_feature,
         opacities=opacity,
         scales=None,
         rotations=None,
         cov3D_precomp=cov,
-    )
-    return rendering
+    )[0]
+    return color
 
 def particle_position_tensor_to_ply(position_tensor, filename):
     # position is (n,3)

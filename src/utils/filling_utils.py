@@ -191,7 +191,7 @@ def internal_filling(
     new_particles: ti.template(),
     start_idx: int,
     max_particles_per_cell: int,
-    exclude_dir: int,
+    exclude_dir: ti.types.vector(n=6, dtype=int),  # Can be a vector of multiple directions or just one
     ray_cast_dir: int,
     threshold: float,
 ) -> int:
@@ -200,7 +200,12 @@ def internal_filling(
         if grid[i, j, k] == 0:
             collision_hit = True
             for dir_type in ti.static(range(6)):
-                if dir_type != exclude_dir:
+                # Check if the current direction is in the exclude_dir list
+                should_exclude = False
+                if exclude_dir[dir_type] == 1:
+                    should_exclude = True
+                
+                if not should_exclude:
                     hit_test = collision_search(
                         grid=grid,
                         grid_density=grid_density,
@@ -357,6 +362,15 @@ def fill_particles(
         grid_density.from_numpy(smoothed_df)
         print("smooth finished")
 
+    # 0: x, 1: -x, 2: y, 3: -y, 4: z, 5: -z direction
+    exclude_dir = ti.Vector([0, 0, 0, 0, 0, 0])
+    if isinstance(search_exclude_dir, list):
+        for dir in search_exclude_dir:
+            exclude_dir[dir] = 1
+    else:
+        exclude_dir[search_exclude_dir] = 1
+    print(exclude_dir)
+
     # fill internal grids
     fill_num = internal_filling(
         grid,
@@ -365,7 +379,7 @@ def fill_particles(
         particles,
         fill_num,
         max_particles_per_cell,
-        exclude_dir=search_exclude_dir,  # 0: x, 1: -x, 2: y, 3: -y, 4: z, 5: -z direction
+        exclude_dir=exclude_dir,  # 0: x, 1: -x, 2: y, 3: -y, 4: z, 5: -z direction
         ray_cast_dir=ray_cast_dir,  # 0: x, 1: -x, 2: y, 3: -y, 4: z, 5: -z direction
         threshold=search_thres,
     )
