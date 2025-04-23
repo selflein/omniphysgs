@@ -1,12 +1,14 @@
+import json
 import math
 import os
-import sys
-from pathlib import Path
+import logging
+from typing import TypedDict
 
 import cv2
 import imageio
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .camera_view_utils import get_camera_view
 from .filling_utils import *
@@ -20,6 +22,9 @@ from gaussian_renderer import GaussianModel
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.system_utils import searchForMaxIteration
+
+
+_logger = logging.getLogger(__name__)
 
 
 class PipelineParamsNoparse:
@@ -116,6 +121,7 @@ def load_params_from_gs(
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
 
+    semantic_feature = pc.get_semantic_feature
     return {
         "pos": means3D,
         "screen_points": means2D,
@@ -125,20 +131,76 @@ def load_params_from_gs(
         "scales": scales,
         "rotations": rotations,
         "cov3D_precomp": cov3D_precomp,
+        "semantic_feature": semantic_feature,
     }
 
 
-def load_params(gaussians, pipeline, preprocessing_params, material_params, model_params, export_path='./'):
-    
+class MaterialPred(TypedDict):
+    semantic_feature: list[float]
+    log_E: float
+    nu: float
+    density: float
+    elasticity_model: str
+    plasticity_model: str
+
+
+def load_material_preds(material_preds_path: str) -> list[MaterialPred]:
+    with open(material_preds_path, "r") as f:
+        material_preds = json.load(f)
+    return material_preds
+
+
+def transfer_material_params(semantic_feature: torch.Tensor, material_preds: list[MaterialPred], material_params) -> dict[str, torch.Tensor]:
+    """Transfer material properties of the closest material prediction in terms of similarity of semantic features.
+
+    Args:
+        semantic_feature: semantic features of the Gaussian
+        material_params: list of material predictions
+
+    Returns:
+        Dictionary of per-Gaussian material properties.
+    """
+    _logger.info("Transferring material parameters...")
+    device = semantic_feature.device
+
+    # Compute similarity between query and material prediction semantic features
+    query_semantic_features = torch.stack([torch.tensor(material_pred["semantic_feature"], device=device) for material_pred in material_preds])
+    query_semantic_features = F.normalize(query_semantic_features, dim=1, p=2)
+    normed_semantic_feature = F.normalize(semantic_feature, dim=1, p=2)
+    sim_matrix = torch.matmul(normed_semantic_feature.squeeze(1), query_semantic_features.T)
+
+    # Assign the material properties with the closest semantic feature to each Gaussian
+    similarity, best_match_idx = torch.max(sim_matrix, dim=1)  # (num_gaussians, )
+
+    # Extract material properties from the best match
+    log_E = torch.tensor([material_preds[idx.item()]["log_E"] for idx in best_match_idx], device=device)
+    nu = torch.tensor([material_preds[idx.item()]["nu"] for idx in best_match_idx], device=device)
+    density = torch.tensor([material_preds[idx.item()]["density"] for idx in best_match_idx], device=device)
+    e_cat = torch.tensor([material_params.elasticity_physicals.index(material_preds[idx.item()]["elasticity_model"]) for idx in best_match_idx], device=device, dtype=torch.long)
+    p_cat = torch.tensor([material_params.plasticity_physicals.index(material_preds[idx.item()]["plasticity_model"]) for idx in best_match_idx], device=device, dtype=torch.long)
+    _logger.info("Transferring material parameters... Done")
+
+    out = {
+        "log_E": log_E,
+        "nu": nu,
+        "density": density,
+        "similarity": similarity,
+        "e_cat": e_cat,
+        "p_cat": p_cat,
+    }
+    return {k: v.unsqueeze(1) for k, v in out.items()}
+
+
+def load_params(gaussians, pipeline, preprocessing_params, material_params, material_preds: list[MaterialPred] | None = None, export_path='./'):
     params = load_params_from_gs(gaussians, pipeline)
 
     init_pos = params["pos"]
     init_cov = params["cov3D_precomp"]
     init_screen_points = params["screen_points"]
     init_opacity = params["opacity"]
-    init_shs = params["shs"]    
-    init_e_cat, init_p_cat = None, None
-    
+    init_shs = params["shs"]
+    init_semantic_feature = params["semantic_feature"]
+
     # throw away low opacity kernels
     mask = init_opacity[:, 0] > preprocessing_params.opacity_threshold
     init_pos = init_pos[mask, :]
@@ -146,6 +208,7 @@ def load_params(gaussians, pipeline, preprocessing_params, material_params, mode
     init_opacity = init_opacity[mask, :]
     init_screen_points = init_screen_points[mask, :]
     init_shs = init_shs[mask, :]
+    init_semantic_feature = init_semantic_feature[mask, :]
 
     # throw away large kernels
     # this is useful when the Gaussian asset is of low quality
@@ -161,13 +224,8 @@ def load_params(gaussians, pipeline, preprocessing_params, material_params, mode
     )
     rotated_pos = apply_rotations(init_pos, rotation_matrices)
 
-    # select a sim area and save params of unslected particles
-    unselected_pos, unselected_cov, unselected_opacity, unselected_shs = (
-        None,
-        None,
-        None,
-        None,
-    )
+    # select a sim area and save params of unselected particles
+    unselected_pos, unselected_cov, unselected_opacity, unselected_shs = (None, None, None, None)
     if preprocessing_params.sim_area is not None:
         boundary = preprocessing_params.sim_area
         assert len(boundary) == 6
@@ -185,13 +243,27 @@ def load_params(gaussians, pipeline, preprocessing_params, material_params, mode
         init_cov = init_cov[mask, :]
         init_opacity = init_opacity[mask, :]
         init_shs = init_shs[mask, :]
-              
-    factor = preprocessing_params.get('scale_factor', 0.95)
-    transformed_pos, scale_origin, original_mean_pos = transform2origin(rotated_pos, factor)
-    transformed_pos = shift2center05(transformed_pos)
+        init_semantic_feature = init_semantic_feature[mask, :]
+
+
+    if preprocessing_params.translate_to_center:
+        factor = preprocessing_params.get('scale_factor', 0.95)
+        transformed_pos, scale_origin, original_mean_pos = transform2origin(rotated_pos, factor)
+        transformed_pos = shift2center05(transformed_pos)
+    else:
+        original_mean_pos = torch.zeros(3, device="cuda", dtype=torch.float32)
+        transformed_pos = rotated_pos
+        scale_origin = 1.0
+
     # modify covariance matrix accordingly
     init_cov = apply_cov_rotations(init_cov, rotation_matrices)
     init_cov = scale_origin * scale_origin * init_cov
+
+    #### Obtain per-Gaussian material properties based on semantic features for each Gaussian
+    if material_preds is not None:
+        per_gaussian_material_params = transfer_material_params(init_semantic_feature, material_preds, material_params)
+    else:
+        per_gaussian_material_params = {}
 
     temp_gs_num = transformed_pos.shape[0]
     filling_params = preprocessing_params.particle_filling
@@ -214,44 +286,44 @@ def load_params(gaussians, pipeline, preprocessing_params, material_params, mode
         ).cuda()
         print(f'Exporting filled particles to {os.path.join(export_path, "filled_particles.ply")}')
         particle_position_tensor_to_ply(pos, os.path.join(export_path, "filled_particles.ply"))
-    
+
+    # Transfer visual properties of the Gaussian
     if filling_params is not None and filling_params["visualize"] == True:
-        shs, opacity, cov = init_filled_particles(
-            pos[:temp_gs_num],
-            init_shs,
-            init_cov,
-            init_opacity,
-            pos[temp_gs_num:],
-        )
+        # FIXME: This is broken now since the spherical harmonics (shs) are 3 dimensional. Need to flatten and unflatten.
+        properties = [init_shs, init_cov, init_opacity]
+        prop_dim = [p.shape[1] for p in properties]
+
+        props = torch.cat(properties, dim=1)
+        new_props = init_filled_particles(pos[:temp_gs_num], props, pos[temp_gs_num:])
+        shs, cov, opacity = new_props.split(prop_dim, dim=1)
     else:
         if filling_params is None:
             pos = transformed_pos
         cov = torch.zeros((pos.shape[0], 6), device='cuda')
         cov[:temp_gs_num] = init_cov
-        shs = init_shs
-        opacity = init_opacity
-        
-    
-    if model_params.normalize_features:
-        # get normalized features
-        n_particles = transformed_pos.shape[0]
-        normalized_cov = flatten_and_normalize(init_cov, n_particles)
-        normalized_shs = flatten_and_normalize(init_shs, n_particles)
-        normalized_opacity = flatten_and_normalize(init_opacity, n_particles)
-        features = torch.cat((pos, normalized_shs, normalized_cov, normalized_opacity), dim=1) # (n, feat_dim)
-    else:
-        n_particles = transformed_pos.shape[0]
-        flattened_cov = init_cov.reshape(n_particles, -1)
-        flattened_shs = init_shs.reshape(n_particles, -1)
-        flattened_opacity = init_opacity.reshape(n_particles, -1)
-        features = torch.cat([pos, flattened_shs, flattened_cov, flattened_opacity], dim=1) # (n, feat_dim)
-    
+        shs = torch.zeros((pos.shape[0], 16, 3), device='cuda')
+        shs[:temp_gs_num] = init_shs
+        # Set opacity for filler particles to 0 so they are invisible
+        opacity = torch.zeros((pos.shape[0], 1), device='cuda')
+        opacity[:temp_gs_num] = init_opacity
+
+    # Assign material properties of "filler" Gaussians based on closest existing Gaussian
+    if filling_params is not None and material_preds is not None:
+        _logger.info("Assigning material properties to filler Gaussians...")
+        prop_dims = [p.shape[1] for p in per_gaussian_material_params.values()]
+        props = torch.cat(list(per_gaussian_material_params.values()), dim=1)
+        props = init_filled_particles(pos[:temp_gs_num], props, pos[temp_gs_num:])
+        import pdb; pdb.set_trace()
+        split_props = props.split(prop_dims, dim=1)
+        # We make use of the fact that dictionaries have deterministic order.
+        per_gaussian_material_params = {k: v for k, v in zip(per_gaussian_material_params.keys(), split_props)}
+
     mpm_params = {
         'pos': pos,
         'cov': cov,
         'opacity': opacity,
         'shs': shs,
-        'features': features,
+        **per_gaussian_material_params,
     }
     unselected_params = {
         'pos': unselected_pos,
@@ -264,8 +336,7 @@ def load_params(gaussians, pipeline, preprocessing_params, material_params, mode
         'scale_origin': scale_origin,
         'original_mean_pos': original_mean_pos
     }
-    
-    return mpm_params, init_e_cat, init_p_cat, unselected_params, translate_params, init_screen_points
+    return mpm_params, unselected_params, translate_params, init_screen_points
 
 
 
@@ -289,6 +360,7 @@ def convert_SH(
     return colors_precomp
 
 def export_rendering(rendering, step, folder, height = None, width = None):
+    os.makedirs(folder, exist_ok=True)
 
     cv2_img = rendering.permute(1, 2, 0).detach().cpu().numpy()
     cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)

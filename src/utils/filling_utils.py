@@ -67,7 +67,11 @@ def densify_grids(
 
             r = ti.max(r, sig[idx])
 
+        # Skip as the covariance matrix was almost singular
         r = ti.ceil(r / grid_dx, dtype=int)
+        if r > grid_density.shape[0]:
+            continue
+
         for dx in range(-r, r + 1):
             for dy in range(-r, r + 1):
                 for dz in range(-r, r + 1):
@@ -331,17 +335,19 @@ def fill_particles(
     ti_pos = ti.Vector.field(n=3, dtype=float, shape=pos.shape[0])
     ti_opacity = ti.field(dtype=float, shape=opacity.shape[0])
     ti_cov = ti.Vector.field(n=6, dtype=float, shape=cov.shape[0])
-    ti_pos.from_torch(pos.reshape(-1, 3))
-    ti_opacity.from_torch(opacity.reshape(-1))
-    ti_cov.from_torch(cov.reshape(-1, 6))
+    ti_pos.from_torch(pos.reshape(-1, 3).clone())
+    ti_opacity.from_torch(opacity.reshape(-1).clone())
+    ti_cov.from_torch(cov.reshape(-1, 6).clone())
 
     grid = ti.field(dtype=int, shape=(grid_n, grid_n, grid_n))
     grid_density = ti.field(dtype=float, shape=(grid_n, grid_n, grid_n))
     particles = ti.Vector.field(n=3, dtype=float, shape=max_samples)
     fill_num = 0
-    # compute density_field
+    print("compute density_field")
+    print(f"{grid_dx=}")
     densify_grids(ti_pos, ti_opacity, ti_cov, grid, grid_density, grid_dx)
-    # fill dense grids
+
+    print("fill dense grids")
     fill_num = fill_dense_grids(
         grid,
         grid_density,
@@ -353,12 +359,10 @@ def fill_particles(
     )
     print("after dense grids: ", fill_num)
 
-    # smooth density_field
     if smooth:
+        print("smooth density_field")
         df = grid_density.to_numpy()
-        smoothed_df = mcubes.smooth(df, method="constrained", max_iters=500).astype(
-            np.float32
-        )
+        smoothed_df = mcubes.smooth(df, method="constrained", max_iters=500).astype(np.float32)
         grid_density.from_numpy(smoothed_df)
         print("smooth finished")
 
@@ -371,7 +375,7 @@ def fill_particles(
         exclude_dir[search_exclude_dir] = 1
     print(exclude_dir)
 
-    # fill internal grids
+    print("fill internal grids")
     fill_num = internal_filling(
         grid,
         grid_density,
@@ -396,65 +400,39 @@ def fill_particles(
 
 @ti.kernel
 def get_attr_from_closest(
-    ti_pos: ti.template(),
-    ti_shs: ti.template(),
-    ti_opacity: ti.template(),
-    ti_cov: ti.template(),
-    ti_new_pos: ti.template(),
-    ti_new_shs: ti.template(),
-    ti_new_opacity: ti.template(),
-    ti_new_cov: ti.template(),
+    pos: ti.template(),
+    prop: ti.template(),
+    new_pos: ti.template(),
+    new_prop: ti.template(),
 ):
-    for pi in range(ti_new_pos.shape[0]):
-        p = ti_new_pos[pi]
+    for pi in range(new_pos.shape[0]):
+        p = new_pos[pi]
         min_dist = 1e10
         min_idx = -1
-        for pj in range(ti_pos.shape[0]):
-            dist = (p - ti_pos[pj]).norm()
+        for pj in range(pos.shape[0]):
+            dist = (p - pos[pj]).norm()
             if dist < min_dist:
                 min_dist = dist
                 min_idx = pj
-        ti_new_shs[pi] = ti_shs[min_idx]
-        ti_new_opacity[pi] = ti_opacity[min_idx]
-        ti_new_cov[pi] = ti_cov[min_idx]
+        new_prop[pi] = prop[min_idx]
 
 
-def init_filled_particles(pos, shs, cov, opacity, new_pos):
-    shs = shs.reshape(pos.shape[0], -1)
+def init_filled_particles(pos, prop, new_pos):
     ti_pos = ti.Vector.field(n=3, dtype=float, shape=pos.shape[0])
-    ti_cov = ti.Vector.field(n=6, dtype=float, shape=cov.shape[0])
-    ti_shs = ti.Vector.field(n=shs.shape[1], dtype=float, shape=shs.shape[0])
-    ti_opacity = ti.field(dtype=float, shape=opacity.shape[0])
-    ti_pos.from_torch(pos.reshape(-1, 3))
-    ti_cov.from_torch(cov.reshape(-1, 6))
-    ti_shs.from_torch(shs)
-    ti_opacity.from_torch(opacity.reshape(-1))
+    ti_prop = ti.Vector.field(n=prop.shape[1], dtype=float, shape=prop.shape[0])
+    ti_pos.from_torch(pos)
+    ti_prop.from_torch(prop)
 
-    new_shs = torch.mean(shs, dim=0).repeat(new_pos.shape[0], 1).cuda()
     ti_new_pos = ti.Vector.field(n=3, dtype=float, shape=new_pos.shape[0])
-    ti_new_shs = ti.Vector.field(n=shs.shape[1], dtype=float, shape=new_pos.shape[0])
-    ti_new_opacity = ti.field(dtype=float, shape=new_pos.shape[0])
-    ti_new_cov = ti.Vector.field(n=6, dtype=float, shape=new_pos.shape[0])
-    ti_new_pos.from_torch(new_pos.reshape(-1, 3))
-    ti_new_shs.from_torch(new_shs)
+    ti_new_prop = ti.Vector.field(n=prop.shape[1], dtype=float, shape=new_pos.shape[0])
+    ti_new_pos.from_torch(new_pos)
+    ti_new_prop.from_torch(torch.zeros(new_pos.shape[0], prop.shape[1]))
 
     get_attr_from_closest(
         ti_pos,
-        ti_shs,
-        ti_opacity,
-        ti_cov,
+        ti_prop,
         ti_new_pos,
-        ti_new_shs,
-        ti_new_opacity,
-        ti_new_cov,
+        ti_new_prop,
     )
-
-    shs_tensor = ti_new_shs.to_torch().cuda()
-    opacity_tensor = ti_new_opacity.to_torch().cuda()
-    cov_tensor = ti_new_cov.to_torch().cuda()
-
-    shs_tensor = torch.cat([shs, shs_tensor], dim=0)
-    shs_tensor = shs_tensor.view(shs_tensor.shape[0], -1, 3)
-    opacity_tensor = torch.cat([opacity, opacity_tensor.reshape(-1, 1)], dim=0)
-    cov_tensor = torch.cat([cov, cov_tensor], dim=0)
-    return shs_tensor, opacity_tensor, cov_tensor
+    new_prop = ti_new_prop.to_torch().cuda()
+    return torch.cat([prop, new_prop], dim=0)
