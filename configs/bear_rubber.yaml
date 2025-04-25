@@ -32,16 +32,17 @@ material:
   elasticity_physicals:
     - 'CorotatedElasticity'
     - 'StVKElasticity'
-    # - 'SigmaElasticity'
-    # - 'VolumeElasticity'
+    - 'SigmaElasticity'
+    - 'VolumeElasticity'
   plasticity_physicals:
     - 'IdentityPlasticity'
     - 'DruckerPragerPlasticity'
-    # - 'SigmaPlasticity'
-    # - 'VonMisesPlasticity'
+    - 'SigmaPlasticity'
+    - 'VonMisesPlasticity'
     # For saving GPU memory. May need to balance label when uncommenting. 
   elasticity: 'neural'
   plasticity: 'neural'
+  vlm_pred_path: 'dataset/bear/material_pred.json'
 
 render:
   white_bg: True

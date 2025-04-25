@@ -7,6 +7,7 @@ from typing import TypedDict
 import cv2
 import imageio
 import numpy as np
+from omegaconf import DictConfig
 import torch
 import torch.nn.functional as F
 
@@ -20,7 +21,7 @@ from diff_gaussian_rasterization import (
 )
 from gaussian_renderer import GaussianModel
 from scene.gaussian_model import GaussianModel
-from utils.sh_utils import eval_sh
+from utils.sh_utils import RGB2SH, eval_sh
 from utils.system_utils import searchForMaxIteration
 
 
@@ -149,6 +150,28 @@ def load_material_preds(material_preds_path: str) -> list[MaterialPred]:
         material_preds = json.load(f)
     return material_preds
 
+def create_assignment_vis_3dgs(gaussians: GaussianModel, best_match_idx: torch.Tensor, export_path: str, selected_mask: torch.BoolTensor):
+    _logger.info("Creating material assignment visualization...")
+    # Create a new PLY file for the assignment visualization
+    gaussians.save_ply(export_path)
+
+    colored_gaussians = GaussianModel(gaussians.active_sh_degree)
+    colored_gaussians.load_ply(export_path)
+
+    # Create a categorical colormap tensor with RGB values in [0, 1] range
+    import matplotlib.pyplot as plt
+    cmap = plt.cm.get_cmap('tab10')
+    cmap_colors = [cmap(i)[:3] for i in range(10)]  # Get RGB values (exclude alpha)
+    cmap_tensor = torch.tensor(cmap_colors, device=best_match_idx.device, dtype=torch.float32)
+
+    # Each Gaussian that is assgined the same material will have the same color
+    colored_gaussians._features_dc[selected_mask] = RGB2SH(cmap_tensor[best_match_idx % len(cmap_tensor)])
+
+    # Set color of unselected/not-simulated Gaussians to black
+    # colored_gaussians._features_dc[~selected_mask, 0] = RGB2SH(torch.zeros_like(cmap_tensor[0]))
+    colored_gaussians.save_ply(export_path)
+    _logger.info("Done...")
+
 
 def transfer_material_params(semantic_feature: torch.Tensor, material_preds: list[MaterialPred], material_params) -> dict[str, torch.Tensor]:
     """Transfer material properties of the closest material prediction in terms of similarity of semantic features.
@@ -173,11 +196,24 @@ def transfer_material_params(semantic_feature: torch.Tensor, material_preds: lis
     similarity, best_match_idx = torch.max(sim_matrix, dim=1)  # (num_gaussians, )
 
     # Extract material properties from the best match
-    log_E = torch.tensor([material_preds[idx.item()]["log_E"] for idx in best_match_idx], device=device)
-    nu = torch.tensor([material_preds[idx.item()]["nu"] for idx in best_match_idx], device=device)
-    density = torch.tensor([material_preds[idx.item()]["density"] for idx in best_match_idx], device=device)
-    e_cat = torch.tensor([material_params.elasticity_physicals.index(material_preds[idx.item()]["elasticity_model"]) for idx in best_match_idx], device=device, dtype=torch.long)
-    p_cat = torch.tensor([material_params.plasticity_physicals.index(material_preds[idx.item()]["plasticity_model"]) for idx in best_match_idx], device=device, dtype=torch.long)
+    # Create lookup tensors for each property
+    log_E_lookup = torch.tensor([pred["log_E"] for pred in material_preds], device=device)
+    nu_lookup = torch.tensor([pred["nu"] for pred in material_preds], device=device)
+    density_lookup = torch.tensor([pred["density"] for pred in material_preds], device=device)
+    # Map elasticity and plasticity models to indices
+    elasticity_indices = {model: idx for idx, model in enumerate(material_params.elasticity_physicals)}
+    plasticity_indices = {model: idx for idx, model in enumerate(material_params.plasticity_physicals)}
+    e_cat_lookup = torch.tensor([elasticity_indices[pred["elasticity_model"]] for pred in material_preds], 
+                               device=device, dtype=torch.long)
+    p_cat_lookup = torch.tensor([plasticity_indices[pred["plasticity_model"]] for pred in material_preds], 
+                               device=device, dtype=torch.long)
+
+    # Use lookup tables
+    log_E = torch.index_select(log_E_lookup, 0, best_match_idx)
+    nu = torch.index_select(nu_lookup, 0, best_match_idx)
+    density = torch.index_select(density_lookup, 0, best_match_idx)
+    e_cat = torch.index_select(e_cat_lookup, 0, best_match_idx)
+    p_cat = torch.index_select(p_cat_lookup, 0, best_match_idx)
     _logger.info("Transferring material parameters... Done")
 
     out = {
@@ -185,13 +221,14 @@ def transfer_material_params(semantic_feature: torch.Tensor, material_preds: lis
         "nu": nu,
         "density": density,
         "similarity": similarity,
+        "best_match_idx": best_match_idx,
         "e_cat": e_cat,
         "p_cat": p_cat,
     }
     return {k: v.unsqueeze(1) for k, v in out.items()}
 
 
-def load_params(gaussians, pipeline, preprocessing_params, material_params, material_preds: list[MaterialPred] | None = None, export_path='./'):
+def load_params(gaussians: GaussianModel, pipeline: PipelineParamsNoparse, preprocessing_params: DictConfig, material_params: DictConfig, material_preds: list[MaterialPred] | None = None, export_path: str = './'):
     params = load_params_from_gs(gaussians, pipeline)
 
     init_pos = params["pos"]
@@ -203,6 +240,7 @@ def load_params(gaussians, pipeline, preprocessing_params, material_params, mate
 
     # throw away low opacity kernels
     mask = init_opacity[:, 0] > preprocessing_params.opacity_threshold
+    sel_gs_indices = torch.nonzero(mask).squeeze()
     init_pos = init_pos[mask, :]
     init_cov = init_cov[mask, :]
     init_opacity = init_opacity[mask, :]
@@ -212,11 +250,11 @@ def load_params(gaussians, pipeline, preprocessing_params, material_params, mate
 
     # throw away large kernels
     # this is useful when the Gaussian asset is of low quality
-    # init_cov = init_cov * 0.5
-    # init_cov_mat = get_mat_from_upper(init_cov)
-    # mask = filter_cov(init_cov_mat, threshold=2e-4)
-    # init_cov[~mask] = 0.5 * init_cov[~mask]
-    
+    init_cov = init_cov * 0.5
+    init_cov_mat = get_mat_from_upper(init_cov)
+    mask = filter_cov(init_cov_mat, threshold=2e-4)
+    init_cov[~mask] = 0.5 * init_cov[~mask]
+
     # rotate and translate
     rotation_matrices = generate_rotation_matrices(
         torch.tensor(preprocessing_params.rotation_degree),
@@ -224,7 +262,7 @@ def load_params(gaussians, pipeline, preprocessing_params, material_params, mate
     )
     rotated_pos = apply_rotations(init_pos, rotation_matrices)
 
-    # select a sim area and save params of unselected particles
+    # select a sim area and save params of unselected particles for later rendering
     unselected_pos, unselected_cov, unselected_opacity, unselected_shs = (None, None, None, None)
     if preprocessing_params.sim_area is not None:
         boundary = preprocessing_params.sim_area
@@ -244,24 +282,22 @@ def load_params(gaussians, pipeline, preprocessing_params, material_params, mate
         init_opacity = init_opacity[mask, :]
         init_shs = init_shs[mask, :]
         init_semantic_feature = init_semantic_feature[mask, :]
+        sel_gs_indices = sel_gs_indices[mask]
 
-
-    if preprocessing_params.translate_to_center:
-        factor = preprocessing_params.get('scale_factor', 0.95)
-        transformed_pos, scale_origin, original_mean_pos = transform2origin(rotated_pos, factor)
-        transformed_pos = shift2center05(transformed_pos)
-    else:
-        original_mean_pos = torch.zeros(3, device="cuda", dtype=torch.float32)
-        transformed_pos = rotated_pos
-        scale_origin = 1.0
+    # Transform the part of the 3DGS reconstruction to be simualated (`sim_area`) to the unit cube
+    factor = preprocessing_params.get('scale_factor', 0.95)
+    transformed_pos, scale_origin, original_mean_pos = transform2origin(rotated_pos, factor)
+    transformed_pos = shift2center05(transformed_pos)
 
     # modify covariance matrix accordingly
     init_cov = apply_cov_rotations(init_cov, rotation_matrices)
     init_cov = scale_origin * scale_origin * init_cov
 
-    #### Obtain per-Gaussian material properties based on semantic features for each Gaussian
+    #### Obtain per-Gaussian material properties by matching SAM features
     if material_preds is not None:
         per_gaussian_material_params = transfer_material_params(init_semantic_feature, material_preds, material_params)
+        if preprocessing_params.visualize_material_assignment:
+            create_assignment_vis_3dgs(gaussians, per_gaussian_material_params["best_match_idx"], os.path.join(export_path, "assignment_vis_3dgs.ply"), selected_mask=sel_gs_indices)
     else:
         per_gaussian_material_params = {}
 
@@ -313,7 +349,6 @@ def load_params(gaussians, pipeline, preprocessing_params, material_params, mate
         prop_dims = [p.shape[1] for p in per_gaussian_material_params.values()]
         props = torch.cat(list(per_gaussian_material_params.values()), dim=1)
         props = init_filled_particles(pos[:temp_gs_num], props, pos[temp_gs_num:])
-        import pdb; pdb.set_trace()
         split_props = props.split(prop_dims, dim=1)
         # We make use of the fact that dictionaries have deterministic order.
         per_gaussian_material_params = {k: v for k, v in zip(per_gaussian_material_params.keys(), split_props)}
