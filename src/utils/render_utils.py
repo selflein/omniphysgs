@@ -366,6 +366,9 @@ def load_params(gaussians: GaussianModel, pipeline: PipelineParamsNoparse, prepr
         'opacity': unselected_opacity,
         'shs': unselected_shs,
     }
+    if not getattr(preprocessing_params, "visualize_unselected", False):
+        unselected_params["opacity"] = torch.zeros_like(unselected_params["opacity"])
+
     translate_params = {
         'rotation_matrices': rotation_matrices,
         'scale_origin': scale_origin,

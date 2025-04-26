@@ -149,7 +149,6 @@ def get_camera_view(
 
         if default_camera_index > -1:
             raw_camera = data[default_camera_index]
-
         else:
             raw_camera = data[0]  # get data to be modified
 
